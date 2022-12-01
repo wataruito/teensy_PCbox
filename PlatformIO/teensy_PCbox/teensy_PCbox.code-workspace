@@ -2,6 +2,10 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"name": "graphicstest",
+			"path": "../../../PlatformIO/ILI9341_t3n/graphicstest"
 		}
 	],
 	"settings": {}
