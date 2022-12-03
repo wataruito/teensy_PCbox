@@ -1,9 +1,30 @@
-/*### teensy_PCbox #########################################################################
+/*### teensy_PCbox #############################################################
 teensy_pcbox.cpp
 2022-07-26 Created by: Wataru Ito
 
 Function:
-    Generates GPIO output to trigger the cameras.
+    Control animal behavior paradigm using Teensy 3.5
+    User can control external devices according user-created program.
+    It can control video camera shutters, LED strip, sound and other devices, like shocker.
+    Touch screen provides user interface.
+
+    Camera trigger (3.3V)
+    LED strip: NeoPixel Stick - 8 x 5050 RGBW LEDs
+        https://www.adafruit.com/product/2868
+    Speakers (up to 2)
+    TTL output for shocker. You need to change to 5V with level shifter.
+    Touch screen: Color 320x240 TFT Touchscreen, ILI9341 Controller Chip
+        https://www.pjrc.com/store/display_ili9341_touch.html
+
+    Sound capability:
+        Audio Adaptor Boards for Teensy 3.x and Teensy 4.x synthesizes sine waves and white noise, etc.
+        Each wave can be changed/modulated and mixed dynamically.
+            https://www.pjrc.com/store/teensy3_audio.html
+
+    Simulated behavior epochs:
+        This is special case when you need to control external devices according to simulated behavior
+        epochs, like animal freezing.
+
 Development env:
     PlatformIO / VScode
 Dependency:
@@ -11,25 +32,15 @@ Dependency:
         https://registry.platformio.org/libraries/spacehuhn/SimpleCLI/installation
     adafruit/Adafruit NeoPixel@^1.10.6
         https://registry.platformio.org/libraries/adafruit/Adafruit%20NeoPixel
-    paulstoffregen/ILI9341_t3
-        https://registry.platformio.org/libraries/paulstoffregen/ILI9341_t3
+    kurte/ILI9341_t3n
+        https://registry.platformio.org/libraries/kurte/ILI9341_t3n
     paulstoffregen/XPT2046_Touchscreen
         https://registry.platformio.org/libraries/paulstoffregen/XPT2046_Touchscreen
 */
 
-/*
-Commands
-    commu_arduino("set_camera -cameras_number " + str(cameraNum))
-    commu_arduino("set_camera -start")
-    commu_arduino("set_camera -fps " + str(fps) + " -exposure " + str(exposure))
-    commu_arduino("set_camera -status")
-    commu_arduino("set_camera -stop")
-    commu_arduino("start paradigm -button")
-*/
 #include <Arduino.h>
-#include <SimpleCLI.h>
 
-/*### hardware initialization #########################################################################*/
+//### hardware initialization ##################################################
 /* Teensy Audio Library
     See
     Teensy Audio Library
@@ -80,11 +91,11 @@ XPT2046_Touchscreen ts(CS_PIN);
 #define TS_MINY 240
 #define TS_MAXY 3800
 
-/* Initialize NeoPixel
+/* NeoPixel
     See
     Adafruit NeoPixel Userguide / Arduino Library Use
     https://learn.adafruit.com/adafruit-neopixel-uberguide/arduino-library-use
-############################################################################*/
+*/
 #include <Adafruit_NeoPixel.h>
 // Which pin on the Arduino is connected to the NeoPixels?
 #define LED_PIN 32
@@ -95,20 +106,21 @@ XPT2046_Touchscreen ts(CS_PIN);
 // Declare our NeoPixel strip object:
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 
-/*### SimpleCLI initialization #########################################################################
+/*### SimpleCLI initialization #################################################
 SimpleCLI command line interface
     First, see the void command_setup() for each command and arguments
     Then, see each callback function for details
-############################################################################*/
+*/
+#include <SimpleCLI.h>
 SimpleCLI cli;
 
-/*### constants and variables #########################################################################*/
-// set touch screen
-Command cmdSetScreen; // Command "set_screen"
+//### constants and variables ##################################################
+// Command "set_screen": control touch screen
+Command cmdSetScreen;
 bool display_button = false;
 
-// set LED strip
-Command cmdSetLed; // Command "set_led"
+// Command "set_led": control LED strip
+Command cmdSetLed;
 //      Set default color for each LED
 uint8_t rgbw_value_stored[8][4] = {
     {255, 0, 0, 0},
@@ -127,12 +139,14 @@ bool led_on = LOW;                 // LED status
 uint8_t neo_pixel_status[8] = {LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW};
 unsigned long neo_pixel_start = 0; // common timer for blinking of all NeoPixel LEDs
 
-// set verbose mode
-Command cmdSetVerbose; // Command "set_verbose"
+// Command "set_verbose": toggle verbose mode
+Command cmdSetVerbose;
 bool verboseStatus = true;
-// control camera trigger
-Command cmdSetCamera; // Command "set_camera"
-// camera control
+
+// Command "set_camera": control camera trigger
+Command cmdSetCamera;
+
+//      camera control
 int fps = 30;                            // Default fps: 30
 float exposure = 0.02;                   // Default exposure time: 20 ms
 float cycle_duration = 1.0 / float(fps); // Default cycle duration: 1/30 sec
@@ -144,12 +158,12 @@ bool camera_shutter_open = false;  // camera shutter status
 bool camera_on_set = false;        // set_camera command status
 unsigned long camera_on_start = 0; // monitor elapsed time after simulation starts
 
-// digital pin assignment
+//      digital pin assignment
 #define PIN_CAMERA_TRIG_OUT 31 // camera trigger generating pin
 #define PIN_CAMERA_TRIG_IN 33  // Control camera start/stop
 
-// paradigm manager
-Command cmdSetParadigm; // Command "set_paradigm"
+// Command "set_paradigm": edit and control paradigm
+Command cmdSetParadigm;
 //      time stamp values in the paradigm table are in millisecond.
 String paradigmName;
 long none = -1; // For create time table arrays
@@ -159,10 +173,17 @@ long tone_end[5] = {none, none, none, none, none};
 long shocker_start[5] = {none, none, none, none, none};
 long shocker_end[5] = {none, none, none, none, none};
 
-// Simulated freezing bouts to digital out
-Command cmdSetFzSimulator; // Command "set_fz_simulator"
-#define DUR_CS 120.0       // The duration of CS, 120.0 seconds
-#define CS_START 241       // 241th frame is the first video frame.
+String paradigm_status = "none";      // whether paradigm is on or off
+String paradigm_status_pre = "dummy"; // previous paradigm status
+long paradigmStartTime = 0;           // time stamp when paradigm starts in millisecond
+long display_timer = millis();        // display timer
+long display_refresh_interval = 200;  // refresh display every 200 ms
+String paradigm_elapsed_time_string;  // elapsed time since paradigm starts in string
+
+// Command "set_fz_simulator": simulated freezing bouts to digital out
+Command cmdSetFzSimulator;
+#define DUR_CS 120.0 // The duration of CS, 120.0 seconds
+#define CS_START 241 // 241th frame is the first video frame.
 
 #define PIN_FZ_SIMU_TRIG_OUT 13 // output for simulated freezing bouts
 #define PIN_FZ_SIMU_TRIG_IN 34  // input from FreezeFrame
@@ -173,8 +194,7 @@ Command cmdSetFzSimulator; // Command "set_fz_simulator"
 
 #define ARRAY_SIZE 100 // max size of fz_start, fz_end array
 
-// Freezing simulation data. The vales represent the frame numbers.
-
+//      Freezing simulation data. The vales represent the frame numbers.
 //      20190408_testing_1_m10ab subject1
 int fz_start_frames_0[] = {266, 291, 296, 312, 335, 348, 372, 388, 454, 466, 493, 510, 533, 549, 579, 605, 626, 682, 702};
 int fz_end_frames_0[] = {282, 295, 303, 327, 344, 366, 387, 437, 462, 486, 506, 526, 542, 572, 596, 622, 641, 692, 715};
@@ -195,74 +215,41 @@ float fz_end[ARRAY_SIZE];
 unsigned long fz_simulation_start_time = 0; // monitor elapsed time after simulation starts
 bool fz_simulation_on = false;              // freezing simulation is on
 bool fz_epoch_on = false;                   // freezing epoch is on
-// set tone
-Command cmdSetTone;       // Command "set_tone"
+
+// Command "set_tone": control tone
+Command cmdSetTone;
 bool tone_on_set = false; // set_tone command status
 int tone_freq = 0;        // Default tone frequency
 float tone_amp = 0.0;     // Default tone amplitude
 
-// set noise
-Command cmdSetNoise;       // Command "set_noise"
+// Command "set_noise": control noise
+Command cmdSetNoise;
 bool noise_on_set = false; // set_noise command status
 float noise_amp = 0.0;     // Default noise amplitude
 
-// start paradigm
-Command cmdStartParadigm;             // Command "start_paradigm"
-String paradigm_status = "none";      // whether paradigm is on or off
-String paradigm_status_pre = "dummy"; // previous paradigm status
-long paradigmStartTime = 0;           // time stamp when paradigm starts in millisecond
-long display_timer = millis();        // display timer
-long display_refresh_interval = 200;  // refresh display every 200 ms
-String paradigm_elapsed_time_string;  // elapsed time since paradigm starts in string
-
 // other parameters
 #define SERIAL_TIMEOUT 100000 // Serial connection timeout in milliseconds
+//      GUI design parameters
+int button_text_x = 130;
+int button_text_y = 170;
+int button_x = button_text_x - 27;
+int button_y = button_text_y - 15;
+int button_w = 100;
+int button_h = 40;
 
-/*### Create IntervalTimer object #########################################################################
+bool button_pressed = false;
+
+/*### Create IntervalTimer object ##############################################
     https://www.pjrc.com/teensy/td_timing_IntervalTimer.html
-############################################################################*/
+*/
 #define TIME_SAMPLING_FREQ 10000 // Timer is set at the maximum (10k Hz).
 #define SEC_IN_MICRO 1000000.0   // constant: 1 second in microseconds
 IntervalTimer int_timer;
 
-/*### command_setup() #########################################################################
+/*### command_setup() ##########################################################
 SimpleCLI command interpreter callback functions
-############################################################################*/
-// Command "start_paradigm" details
-void start_paradigmCallback(cmd *cmdPtr)
-{
-    Command cmd(cmdPtr);
-
-    Argument arg = cmd.getArgument("on");
-    if (arg.isSet())
-    {
-        paradigm_status = "on";
-        paradigmStartTime = millis();
-    }
-    else
-    {
-        paradigm_status = "off";
-    }
-
-    arg = cmd.getArgument("off");
-    if (arg.isSet())
-    {
-        paradigm_status = "off";
-    }
-
-    arg = cmd.getArgument("triggered");
-    if (arg.isSet())
-    {
-        paradigm_status = "triggered";
-    }
-
-    arg = cmd.getArgument("none");
-    if (arg.isSet())
-    {
-        paradigm_status = "none";
-    }
-}
-// Command "set_screen" details
+*/
+// Command "set_screen": control touch screen
 void touchscreen_greeting()
 {
     tft.fillScreen(ILI9341_BLACK);
@@ -284,13 +271,7 @@ void touchscreen_clear()
 }
 void touchscreen_paradigm()
 {
-
-    int _b_text_x = 130;
-    int _b_text_y = 170;
-    int _b_x = _b_text_x - 27;
-    int _b_y = _b_text_y - 15;
-    int _b_w = 100;
-    int _b_h = 40;
+    // position of the button and text
 
     bool paradigm_status_changed = false;
     float _paradigm_elapsed_time = 0.0;
@@ -344,14 +325,14 @@ void touchscreen_paradigm()
         // button blinking if (display_button)
         if (display_button)
         {
-            tft.fillRect(_b_x, _b_y, _b_w, _b_h, ILI9341_BLACK);
+            tft.fillRect(button_x, button_y, button_w, button_h, ILI9341_BLACK);
             display_button = false;
         }
         else
         {
-            tft.fillRect(_b_x, _b_y, _b_w, _b_h, ILI9341_RED);
+            tft.fillRect(button_x, button_y, button_w, button_h, ILI9341_RED);
             tft.setTextColor(ILI9341_WHITE);
-            tft.setCursor(_b_text_x, _b_text_y);
+            tft.setCursor(button_text_x, button_text_y);
             tft.println("Abort");
             display_button = true;
         }
@@ -372,14 +353,14 @@ void touchscreen_paradigm()
         // button blinking if (display_button)
         if (display_button)
         {
-            tft.fillRect(_b_x, _b_y, _b_w, _b_h, ILI9341_BLACK);
+            tft.fillRect(button_x, button_y, button_w, button_h, ILI9341_BLACK);
             display_button = false;
         }
         else
         {
-            tft.fillRect(_b_x, _b_y, _b_w, _b_h, ILI9341_BLUE);
+            tft.fillRect(button_x, button_y, button_w, button_h, ILI9341_BLUE);
             tft.setTextColor(ILI9341_WHITE);
-            tft.setCursor(_b_text_x, _b_text_y);
+            tft.setCursor(button_text_x, button_text_y);
             tft.println("Start");
             display_button = true;
         }
@@ -419,7 +400,8 @@ void set_screenCallback(cmd *cmdPtr)
         // Serial.println("clear");
     }
 }
-// Command "set_led" details
+
+// Command "set_led": control LED strip
 void set_ledCallback(cmd *cmdPtr)
 {
     String rgbw[] = {"r", "g", "b", "w"};
@@ -452,7 +434,8 @@ void set_ledCallback(cmd *cmdPtr)
                                             rgbw_value_stored[_led_n][2], rgbw_value_stored[_led_n][3]));
     strip.show();
 }
-// Command "set_verbose" details
+
+// Command "set_verbose": toggle verbose mode
 void set_verboseCallback(cmd *cmdPtr)
 {
     Command cmd(cmdPtr);
@@ -472,7 +455,102 @@ void set_verboseCallback(cmd *cmdPtr)
         Serial.println("Verbose mode OFF");
     }
 }
-// Command "set_paradigm" details
+
+// Command "set_camera": control camera trigger
+//      Check fps and exposure time are valid
+bool check_consistency(int _fps, float _exposure)
+{
+    float _cycle_duration = 1.0 / float(_fps);
+    if (_cycle_duration < _exposure)
+    {
+        Serial.println("Error: exposure time is longer than cycle duration");
+        Serial.println("       fps or exposure is automatically adjusted.");
+        return false;
+    }
+    else
+    {
+        return true;
+    }
+}
+void print_status()
+{
+    Serial.print("Camera status: ");
+    Serial.print(camera_on);
+    Serial.print(", fps: ");
+    Serial.print(fps);
+    Serial.print(", exposure: ");
+    Serial.print(exposure * 1000.0);
+    Serial.print(" ms, cycle duration: ");
+    Serial.print(cycle_duration * 1000.0);
+    Serial.println(" ms");
+}
+void set_cameraCallback(cmd *cmdPtr)
+{
+    Command cmd(cmdPtr);
+    Argument arg = cmd.getArgument("start");
+    bool _set_cameraStart = arg.isSet();
+    if (_set_cameraStart)
+    {
+        camera_on_set = true;
+        // Serial.println(camera_on_set);
+        print_status();
+    }
+
+    arg = cmd.getArgument("stop");
+    bool _set_cameraStop = arg.isSet();
+    if (_set_cameraStop)
+    {
+        camera_on_set = false;
+        // Serial.println(camera_on_set);
+    }
+
+    arg = cmd.getArgument("status");
+    bool _set_cameraStatus = arg.isSet();
+    if (_set_cameraStatus)
+    {
+        print_status();
+    }
+
+    arg = cmd.getArgument("fps");
+    int _fps = arg.getValue().toInt();
+    if (_fps != -1)
+    {
+        if (check_consistency(_fps, exposure))
+        {
+            fps = _fps;
+            cycle_duration = 1.0 / float(fps);
+            print_status();
+        }
+        else
+        {
+            fps = _fps;
+            cycle_duration = 1.0 / float(fps);
+            exposure = cycle_duration * 0.5;
+            print_status();
+        }
+    }
+
+    arg = cmd.getArgument("exposure");
+    float _exposure = arg.getValue().toFloat();
+    if (_exposure != -1.0)
+    {
+        if (check_consistency(fps, _exposure / 1000.0))
+        {
+            exposure = _exposure / 1000.0;
+            cycle_duration = 1.0 / float(fps);
+            print_status();
+        }
+        else
+        {
+            exposure = _exposure / 1000.0;
+            fps = int(1.0 / exposure);
+            cycle_duration = 1.0 / float(fps);
+            print_status();
+        }
+    }
+}
+
+// Command "set_paradigm": edit and control paradigm
 void set_paradigmCallback(cmd *cmdPtr)
 {
     Command cmd(cmdPtr);
@@ -583,101 +661,38 @@ void set_paradigmCallback(cmd *cmdPtr)
             Serial.println(" sec");
         }
     }
-}
-// Command "set_camera" details
-//      Check fps and exposure time are valid
-bool check_consistency(int _fps, float _exposure)
-{
-    float _cycle_duration = 1.0 / float(_fps);
-    if (_cycle_duration < _exposure)
+
+    arg = cmd.getArgument("on");
+    if (arg.isSet())
     {
-        Serial.println("Error: exposure time is longer than cycle duration");
-        Serial.println("       fps or exposure is automatically adjusted.");
-        return false;
+        paradigm_status = "on";
+        paradigmStartTime = millis();
     }
     else
     {
-        return true;
+        paradigm_status = "off";
+    }
+
+    arg = cmd.getArgument("off");
+    if (arg.isSet())
+    {
+        paradigm_status = "off";
+    }
+
+    arg = cmd.getArgument("triggered");
+    if (arg.isSet())
+    {
+        paradigm_status = "triggered";
+    }
+
+    arg = cmd.getArgument("none");
+    if (arg.isSet())
+    {
+        paradigm_status = "none";
     }
 }
-void print_status()
-{
-    Serial.print("Camera status: ");
-    Serial.print(camera_on);
-    Serial.print(", fps: ");
-    Serial.print(fps);
-    Serial.print(", exposure: ");
-    Serial.print(exposure * 1000.0);
-    Serial.print(" ms, cycle duration: ");
-    Serial.print(cycle_duration * 1000.0);
-    Serial.println(" ms");
-}
-void set_cameraCallback(cmd *cmdPtr)
-{
-    Command cmd(cmdPtr);
-    Argument arg = cmd.getArgument("start");
-    bool _set_cameraStart = arg.isSet();
-    if (_set_cameraStart)
-    {
-        camera_on_set = true;
-        // Serial.println(camera_on_set);
-        print_status();
-    }
 
-    arg = cmd.getArgument("stop");
-    bool _set_cameraStop = arg.isSet();
-    if (_set_cameraStop)
-    {
-        camera_on_set = false;
-        // Serial.println(camera_on_set);
-    }
-
-    arg = cmd.getArgument("status");
-    bool _set_cameraStatus = arg.isSet();
-    if (_set_cameraStatus)
-    {
-        print_status();
-    }
-
-    arg = cmd.getArgument("fps");
-    int _fps = arg.getValue().toInt();
-    if (_fps != -1)
-    {
-        if (check_consistency(_fps, exposure))
-        {
-            fps = _fps;
-            cycle_duration = 1.0 / float(fps);
-            print_status();
-        }
-        else
-        {
-            fps = _fps;
-            cycle_duration = 1.0 / float(fps);
-            exposure = cycle_duration * 0.5;
-            print_status();
-        }
-    }
-
-    arg = cmd.getArgument("exposure");
-    float _exposure = arg.getValue().toFloat();
-    if (_exposure != -1.0)
-    {
-        if (check_consistency(fps, _exposure / 1000.0))
-        {
-            exposure = _exposure / 1000.0;
-            cycle_duration = 1.0 / float(fps);
-            print_status();
-        }
-        else
-        {
-            exposure = _exposure / 1000.0;
-            fps = int(1.0 / exposure);
-            cycle_duration = 1.0 / float(fps);
-            print_status();
-        }
-    }
-}
-// Command "set_fz_simulator" details
+// Command "set_fz_simulator": simulated freezing bouts to digital out
 // Convert from frame to seconds
 void conv_frame_to_sec(int start_end_frames[], float start_end[], int size_array)
 {
@@ -762,7 +777,8 @@ void set_fz_simulatorCallback(cmd *cmdPtr)
         }
     }
 }
-// Command "set_tone" details
+
+// Command "set_tone": control tone
 void tone_show_status()
 {
     Serial.print("Tone status: ");
@@ -812,7 +828,8 @@ void set_toneCallback(cmd *cmdPtr)
     }
     tone_show_status();
 }
-// Command "set_noise" details
+
+// Command "set_noise": control noise
 void noise_show_status()
 {
     Serial.print("Noise status: ");
@@ -852,6 +869,7 @@ void set_noiseCallback(cmd *cmdPtr)
     }
     noise_show_status();
 }
+
 // Error processing
 void errorCallback(cmd_error *errorPtr)
 {
@@ -868,17 +886,18 @@ void errorCallback(cmd_error *errorPtr)
         Serial.println(cli.toString());
     }
 }
+
 // Defining commands
 void command_setup()
 {
     // Register commands for Command line interface
 
     // Command "start_paradigm"
-    cmdStartParadigm = cli.addCommand("start_paradigm", start_paradigmCallback);
-    cmdStartParadigm.addFlagArgument("on");
-    cmdStartParadigm.addFlagArgument("off");
-    cmdStartParadigm.addFlagArgument("triggered");
-    cmdStartParadigm.addFlagArgument("none");
+    // cmdStartParadigm = cli.addCommand("start_paradigm", start_paradigmCallback);
+    // cmdStartParadigm.addFlagArgument("on");
+    // cmdStartParadigm.addFlagArgument("off");
+    // cmdStartParadigm.addFlagArgument("triggered");
+    // cmdStartParadigm.addFlagArgument("none");
 
     // Command "set_screen"
     cmdSetScreen = cli.addCommand("set_screen", set_screenCallback);
@@ -910,6 +929,10 @@ void command_setup()
     cmdSetParadigm.addArgument("end", "-1");
     cmdSetParadigm.addArgument("paradigm_duration", "-1");
     cmdSetParadigm.addArgument("paradigm_name", "");
+    cmdSetParadigm.addFlagArgument("on");
+    cmdSetParadigm.addFlagArgument("off");
+    cmdSetParadigm.addFlagArgument("none");
+    cmdSetParadigm.addFlagArgument("triggered");
 
     // Command "set_camera"
     cmdSetCamera = cli.addCommand("set_camera", set_cameraCallback);
@@ -941,9 +964,9 @@ void command_setup()
     cli.setOnError(errorCallback);
 }
 
-/*### interval_timer_callback() #########################################################################
+/*### interval_timer_callback() ################################################
 // Functions called from interval_timer started in void setup()
-############################################################################*/
+*/
 // Control NeoPixel LED
 void led_control(int _led_n, uint8_t led_on)
 {
@@ -967,7 +990,7 @@ void led_control(int _led_n, uint8_t led_on)
         }
     }
 }
-// Control LED blinking
+//      Control LED blinking
 void led_blink(int _led_n)
 {
     unsigned long time_now = millis();
@@ -983,8 +1006,9 @@ void led_blink(int _led_n)
 
     led_control(_led_n, led_on);
 }
+
 // Control the camera
-void generate_camera_trigger()
+void camera_trigger_manager()
 {
     // Monitor PIN_CAMERA_TRIG_IN
     if ((digitalRead(PIN_CAMERA_TRIG_IN) == HIGH) || (camera_on_set))
@@ -1047,6 +1071,7 @@ void generate_camera_trigger()
         led_blink(NEO_PIXEL_CAMERA);
     }
 }
+
 // fz simulator
 // Return the index of the nearest earlier events
 int current_time_is_in_epoch(float x, float start[], float end[], int size_array)
@@ -1061,7 +1086,7 @@ int current_time_is_in_epoch(float x, float start[], float end[], int size_array
 
     return -1;
 }
-void simulated_fz()
+void simulated_fz_manager()
 {
     // Monitor PIN_FZ_SIMU_TRIG_IN
     if (digitalRead(PIN_FZ_SIMU_TRIG_IN) == HIGH)
@@ -1135,19 +1160,10 @@ void simulated_fz()
         led_blink(NEO_PIXEL_FZ_SIMU);
     }
 }
+
 // paradigm manager
 void paradigm_manager()
 {
-    // long _current_time = millis();
-    // float _paradigm_elapsed_time = 0.0;
-
-    // // refresh display every display_refresh_interval
-    // if (_current_time - display_timer >= display_refresh_interval)
-    // {
-    //     display_timer = _current_time;
-    //     touchscreen_paradigm();
-    // }
-
     // running paradigm
     if (paradigm_status == "on")
     {
@@ -1179,17 +1195,18 @@ void paradigm_manager()
         // }
     }
 }
+
 // IntervalTimer callback function
 void interval_timer_callback()
 {
-    generate_camera_trigger();
-    simulated_fz();
+    camera_trigger_manager();
+    simulated_fz_manager();
     paradigm_manager();
 }
 
-/*### setup() #########################################################################
+/*### setup() ##################################################################
 // Functions called from void setup()
-############################################################################*/
+*/
 void init_pins()
 {
     // initialize digital pins.
@@ -1274,9 +1291,9 @@ void setup()
     paradigm_status = "off";
 }
 
-/*### loop() ########################################################################
+/*### loop() ###################################################################
 // Functions called from void loop()
-############################################################################*/
+*/
 void input_manager()
 {
     if (Serial.available())
@@ -1303,13 +1320,38 @@ void touchscreen_manager()
         touchscreen_paradigm();
 
         // touch screen
-        // once activated, display size shrinks half.
-        if (!ts.bufferEmpty())
+        if (ts.touched())
         {
             TS_Point p = ts.getPoint();
             p.x = map(p.x, TS_MAXX, TS_MINX, 0, tft.width());
             p.y = map(p.y, TS_MAXY, TS_MINY, 0, tft.height());
             tft.fillCircle(p.x, p.y, 5, ILI9341_RED);
+
+            if (p.x > button_x && p.x < button_x + button_w && p.y > button_y && p.y < button_y + button_h)
+            {
+                Serial.println("Button pressed");
+                button_pressed = true;
+            }
+        }
+        else
+        {
+            button_pressed = false;
+        }
+
+        // update paradigm status based on button pressed
+        if (button_pressed)
+        {
+            if (paradigm_status == "triggered")
+            {
+                paradigm_status = "on";
+                paradigmStartTime = millis();
+                camera_on_set = true;
+            }
+            else if (paradigm_status == "on")
+            {
+                paradigm_status = "off";
+                camera_on_set = false;
+            }
         }
     }
 }
@@ -1320,12 +1362,6 @@ void loop()
 
     // Touchscreen
     touchscreen_manager();
-
-    // waveform1.frequency(8000);
-    // waveform1.amplitude(0.2);
-    // delay(250);
-    // waveform1.amplitude(0);
-    // delay(1750);
 }
 
-/*### end of code ####################################################################*/
+//### end of code ##############################################################
