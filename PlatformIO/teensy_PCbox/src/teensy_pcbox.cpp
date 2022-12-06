@@ -95,6 +95,9 @@ XPT2046_Touchscreen ts(CS_PIN);
     See
     Adafruit NeoPixel Userguide / Arduino Library Use
     https://learn.adafruit.com/adafruit-neopixel-uberguide/arduino-library-use
+
+    strip.show() takes 350 micros, which is more than the timer interrupt period of 100 micros.
+
 */
 #include <Adafruit_NeoPixel.h>
 // Which pin on the Arduino is connected to the NeoPixels?
@@ -122,7 +125,7 @@ bool display_button = false;
 // Command "set_led": control LED strip
 Command cmdSetLed;
 //      Set default color for each LED
-uint8_t rgbw_value_stored[8][4] = {
+uint8_t rgbw_value_stored[LED_COUNT][4] = {
     {255, 0, 0, 0},
     {0, 255, 0, 0},
     {0, 0, 255, 0},
@@ -136,8 +139,9 @@ uint8_t rgbw_value_stored[8][4] = {
 #define NEO_PIXEL_FZ_SIMU 1        // NeoPixel LED indicator for freezing simulation
 unsigned long led_start = 0;       // monitor elapsed time after LED starts blinking cycle
 bool led_on = LOW;                 // LED status
-uint8_t neo_pixel_status[8] = {LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW};
+uint8_t neo_pixel_status[LED_COUNT] = {LOW, LOW, LOW, LOW, LOW, LOW, LOW, LOW};
 unsigned long neo_pixel_start = 0; // common timer for blinking of all NeoPixel LEDs
+bool led_set_on = false;           // enable/disable NeoPixel LEDs
 
 // Command "set_verbose": toggle verbose mode
 Command cmdSetVerbose;
@@ -147,7 +151,7 @@ bool verboseStatus = true;
 Command cmdSetCamera;
 
 //      camera control
-int fps = 30;                            // Default fps: 30
+int fps = 10;                            // Default fps: 30
 float exposure = 0.02;                   // Default exposure time: 20 ms
 float cycle_duration = 1.0 / float(fps); // Default cycle duration: 1/30 sec
 
@@ -242,9 +246,18 @@ bool button_pressed = false;
 /*### Create IntervalTimer object ##############################################
     https://www.pjrc.com/teensy/td_timing_IntervalTimer.html
 */
-#define TIME_SAMPLING_FREQ 10000 // Timer is set at the maximum (10k Hz).
-#define SEC_IN_MICRO 1000000.0   // constant: 1 second in microseconds
+#define TIME_SAMPLING_FREQ 100000 // Timer is set at the maximum (100k Hz).
+#define SEC_IN_MICRO 1000000.0    // constant: 1 second in microseconds
 IntervalTimer int_timer;
+
+long timer_callback_start = micros();
+bool timer_callback_on = false;
+long timer_cycle_in_micros = 0;
+
+int timer_cycle_failure_count = 0;
+long timer_cycle_failure_timer = 0;
+long timer_cycle_failure_timer_start = 0;
+long timer_cycle_failure_cycle_duration[100];
 
 /*### command_setup() ##########################################################
 SimpleCLI command interpreter callback functions
@@ -376,6 +389,43 @@ void touchscreen_paradigm()
     // tft.updateScreenAsync();
     tft.updateScreen();
 }
+void touchscreen_touch()
+{
+    // touch screen
+    if (ts.touched())
+    {
+        TS_Point p = ts.getPoint();
+        p.x = map(p.x, TS_MAXX, TS_MINX, 0, tft.width());
+        p.y = map(p.y, TS_MAXY, TS_MINY, 0, tft.height());
+        tft.fillCircle(p.x, p.y, 5, ILI9341_RED);
+
+        if (p.x > button_x && p.x < button_x + button_w && p.y > button_y && p.y < button_y + button_h)
+        {
+            Serial.println("Button pressed");
+            button_pressed = true;
+        }
+    }
+    else
+    {
+        button_pressed = false;
+    }
+
+    // update paradigm status based on button pressed
+    if (button_pressed)
+    {
+        if (paradigm_status == "triggered")
+        {
+            paradigm_status = "on";
+            paradigmStartTime = millis();
+            camera_on_set = true;
+        }
+        else if (paradigm_status == "on")
+        {
+            paradigm_status = "off";
+            camera_on_set = false;
+        }
+    }
+}
 void set_screenCallback(cmd *cmdPtr)
 {
     Command cmd(cmdPtr);
@@ -408,7 +458,25 @@ void set_ledCallback(cmd *cmdPtr)
     uint8_t rgbw_value[4];
 
     Command cmd(cmdPtr);
-    Argument arg = cmd.getArgument("led");
+
+    Argument arg = cmd.getArgument("start");
+    if (arg.isSet())
+    {
+        led_set_on = true;
+    }
+    arg = cmd.getArgument("stop");
+    if (arg.isSet())
+    {
+        led_set_on = false;
+        for (int _led_n = 0; _led_n < LED_COUNT; _led_n++)
+        {
+            strip.setPixelColor(_led_n, strip.Color(0, 0, 0, 0));
+            neo_pixel_status[_led_n] = LOW;
+        }
+        strip.show();
+    }
+
+    arg = cmd.getArgument("led");
     int _led_n = arg.getValue().toInt();
 
     for (int i = 0; i < 4; i++)
@@ -907,6 +975,8 @@ void command_setup()
 
     // Command "set_led"
     cmdSetLed = cli.addCommand("set_led", set_ledCallback);
+    cmdSetLed.addFlagArgument("start");
+    cmdSetLed.addFlagArgument("stop");
     cmdSetLed.addArgument("led", "-1");
     cmdSetLed.addArgument("r", "0");
     cmdSetLed.addArgument("g", "0");
@@ -977,7 +1047,10 @@ void led_control(int _led_n, uint8_t led_on)
             strip.setPixelColor(_led_n, strip.Color(rgbw_value_stored[_led_n][0], rgbw_value_stored[_led_n][1],
                                                     rgbw_value_stored[_led_n][2], rgbw_value_stored[_led_n][3]));
             neo_pixel_status[_led_n] = HIGH;
-            strip.show();
+            if (led_set_on)
+            {
+                strip.show();
+            }
         }
     }
     else
@@ -986,7 +1059,10 @@ void led_control(int _led_n, uint8_t led_on)
         {
             strip.setPixelColor(_led_n, strip.Color(0, 0, 0, 0));
             neo_pixel_status[_led_n] = LOW;
-            strip.show();
+            if (led_set_on)
+            {
+                strip.show();
+            }
         }
     }
 }
@@ -1199,9 +1275,43 @@ void paradigm_manager()
 // IntervalTimer callback function
 void interval_timer_callback()
 {
+    // Monitor timer_cycle_failure
+    timer_callback_start = micros();
+    if (timer_callback_on)
+    {
+        Serial.println("timer_callback is already on");
+    }
+    timer_callback_on = true;
+
+    // Run the managers
     camera_trigger_manager();
     simulated_fz_manager();
     paradigm_manager();
+
+    // Monitor timer_cycle_failure
+    long _cycle_duration = micros() - timer_callback_start;
+
+    if (_cycle_duration > timer_cycle_in_micros)
+    {
+        timer_cycle_failure_timer = micros() - timer_cycle_failure_timer_start;
+        if (timer_cycle_failure_timer >= 1000000)
+        {
+            Serial.print("timer_cycle_failure_count: ");
+            Serial.print(timer_cycle_failure_count);
+            Serial.print(",   cycle_durations: ");
+            for (int i = 0; i < timer_cycle_failure_count; i++)
+            {
+                Serial.print(timer_cycle_failure_cycle_duration[i]);
+                Serial.print(" ");
+            }
+            Serial.println();
+            timer_cycle_failure_timer_start = micros();
+            timer_cycle_failure_count = 0;
+        }
+        timer_cycle_failure_cycle_duration[timer_cycle_failure_count] = _cycle_duration;
+        timer_cycle_failure_count++;
+    }
+    timer_callback_on = false;
 }
 
 /*### setup() ##################################################################
@@ -1279,16 +1389,18 @@ void setup()
     command_setup();
 
     // Generate callback for the timer
-    int timer_micros = 1000000 / TIME_SAMPLING_FREQ;
-    int_timer.begin(interval_timer_callback, timer_micros);
+    timer_cycle_in_micros = 1000000 / TIME_SAMPLING_FREQ;
+    int_timer.begin(interval_timer_callback, timer_cycle_in_micros);
+
+    paradigm_status = "off";
+    delay(1000);
 
     // Greeting message
     Serial.println("Welcome to PCBox: Paradigm Controlling Box");
     // tft.setTextColor(ILI9341_GREEN);
     touchscreen_greeting();
     // tft.setTextColor(ILI9341_YELLOW);
-    delay(5000);
-    paradigm_status = "off";
+    delay(3000);
 }
 
 /*### loop() ###################################################################
@@ -1318,41 +1430,7 @@ void touchscreen_manager()
     {
         display_timer = _current_time;
         touchscreen_paradigm();
-
-        // touch screen
-        if (ts.touched())
-        {
-            TS_Point p = ts.getPoint();
-            p.x = map(p.x, TS_MAXX, TS_MINX, 0, tft.width());
-            p.y = map(p.y, TS_MAXY, TS_MINY, 0, tft.height());
-            tft.fillCircle(p.x, p.y, 5, ILI9341_RED);
-
-            if (p.x > button_x && p.x < button_x + button_w && p.y > button_y && p.y < button_y + button_h)
-            {
-                Serial.println("Button pressed");
-                button_pressed = true;
-            }
-        }
-        else
-        {
-            button_pressed = false;
-        }
-
-        // update paradigm status based on button pressed
-        if (button_pressed)
-        {
-            if (paradigm_status == "triggered")
-            {
-                paradigm_status = "on";
-                paradigmStartTime = millis();
-                camera_on_set = true;
-            }
-            else if (paradigm_status == "on")
-            {
-                paradigm_status = "off";
-                camera_on_set = false;
-            }
-        }
+        touchscreen_touch();
     }
 }
 void loop()
